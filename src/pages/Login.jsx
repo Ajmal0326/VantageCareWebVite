@@ -36,6 +36,8 @@ const [showPassword, setShowPassword] = useState(false);
       login({
         name: name || "No Name",
         role: role || "user",
+        userID:userId || "no ID",
+        email:email || "no email",
       });
       navigate('/dashboard');
       // alert(`Login successful. Your role is ${role}`);

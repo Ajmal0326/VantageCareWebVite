@@ -9,9 +9,11 @@ import PrivateRoute from './routes/PrivateRoute';
 import Timesheet from './pages/Timesheet';
 import Dashboard from './pages/Dashboard ';
 import Certificate from './pages/Certificate';
+import { useAuth } from './context/AuthContext';
 
 function App() {
 
+  const { user } = useAuth();
   return (
     <>
       <BrowserRouter>

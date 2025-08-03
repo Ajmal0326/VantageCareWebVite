@@ -3,6 +3,8 @@ import Sidebar from '../Components/Sidebar';
 import Navbar from '../Components/Navbar';
 
 const MainLayout = ({ children }) => {
+
+
   return (
     <div className="h-screen flex flex-col">
       <Navbar />
