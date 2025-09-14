@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useCallback } from "react";
 import { FaCalendarAlt, FaCommentDots } from "react-icons/fa";
 import { useAuth } from "../context/AuthContext";
 import { db } from "../firebase";
@@ -9,7 +9,68 @@ import {
   updateDoc,
   getDoc,
 } from "firebase/firestore";
-import { arrayUnion } from "firebase/firestore";
+import { arrayUnion, arrayRemove } from "firebase/firestore";
+import { serverTimestamp } from "firebase/firestore";
+import { Timestamp } from "firebase/firestore";
+// ======= NDIS / Policy knobs =======
+const DEFAULT_WEEKLY_CAP_HOURS = 38;
+const MIN_REST_HOURS = 10;
+const MAX_DAILY_HOURS = 12;
+
+const ROLE_DURATION_MIN = {
+  morning: 360, // 6h
+  evening: 360, // 6h
+  night: 600,   // 10h
+};
+
+// --------- Time helpers ----------
+const minutesOverlap = (aStart, aEnd, bStart, bEnd) => {
+  const start = Math.max(aStart.getTime(), bStart.getTime());
+  const end = Math.min(aEnd.getTime(), bEnd.getTime());
+  return Math.max(0, Math.floor((end - start) / 60000));
+};
+
+const sameLocalDay = (d1, d2) =>
+  d1.getFullYear() === d2.getFullYear() &&
+  d1.getMonth() === d2.getMonth() &&
+  d1.getDate() === d2.getDate();
+
+function getIsoWeekWindow(date) {
+  const local = new Date(date);
+  const day = (local.getDay() + 6) % 7; // Mon=0
+  const start = new Date(local);
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - day);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 7);
+  return { start, end };
+}
+
+function parseShiftToDateRange(shift) {
+  const start = new Date(`${shift.shiftDate}T${shift.shiftStartTime}:00`);
+  let end = null;
+
+  if (shift.shiftEndTime) {
+    end = new Date(`${shift.shiftDate}T${shift.shiftEndTime}:00`);
+    if (end <= start) end = new Date(end.getTime() + 24 * 60 * 60 * 1000);
+  } else if (shift.durationMinutes) {
+    end = new Date(start.getTime() + shift.durationMinutes * 60000);
+  } else if (shift.shiftRole) {
+    const mins = ROLE_DURATION_MIN[(shift.shiftRole || "").toLowerCase()] || 0;
+    end = new Date(start.getTime() + mins * 60000);
+  }
+
+  return { start, end };
+}
+
+// --------- UI helpers ----------
+const pct = (used, cap) => (cap > 0 ? Math.min(100, Math.max(0, (used / cap) * 100)) : 0);
+const usageColor = (p) =>
+  p >= 90 ? "bg-red-500" : p >= 60 ? "bg-amber-500" : "bg-green-500";
+const chipColor = (p) =>
+  p >= 90 ? "text-red-700 bg-red-50 ring-red-200" :
+  p >= 60 ? "text-amber-700 bg-amber-50 ring-amber-200" :
+            "text-green-700 bg-green-50 ring-green-200";
 
 const Dashboard = () => {
   const { user } = useAuth();
@@ -17,6 +78,7 @@ const Dashboard = () => {
   const [shiftRole, setShiftRole] = useState("");
   const [shiftDate, setShiftDate] = useState("");
   const [shiftStartTime, setShiftStartTime] = useState("");
+  const [shiftEndTime, setShiftEndTime] = useState("");
   const [selectedUserId, setSelectedUserId] = useState("");
   const [loadingStaff, setLoadingStaff] = useState(false);
   const [nextShift, setNextShift] = useState(null);
@@ -26,192 +88,301 @@ const Dashboard = () => {
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [messages, setMessages] = useState([]);
   const [showMessagesList, setShowMessagesList] = useState(false);
+  const [validationError, setValidationError] = useState("");
 
-  // Fetch all staff and shifts
+  // compute weekly used/left hours for a staff
+  const computeWeeklyUsage = useCallback((u, refDate = new Date()) => {
+    const cap = Number(u.weeklyHourCap) || DEFAULT_WEEKLY_CAP_HOURS;
+    const { start, end } = getIsoWeekWindow(refDate);
+    let minutes = 0;
+
+    for (const s of u.shifts || []) {
+      if (s.status === "cancelled") continue;
+      const { start: sStart, end: sEnd } = parseShiftToDateRange(s);
+      if (!sStart || !sEnd) continue;
+      minutes += minutesOverlap(sStart, sEnd, start, end);
+    }
+
+    const usedHours = +(minutes / 60).toFixed(2);
+    const left = Math.max(0, +(cap - usedHours).toFixed(2));
+    return { usedHours, left, cap, usedPct: pct(usedHours, cap) };
+  }, []);
+
+  const refetchStaff = useCallback(async () => {
+    setLoadingStaff(true);
+    try {
+      const querySnapshot = await getDocs(collection(db, "UsersDetail"));
+      const staff = querySnapshot.docs
+        .map((docSnap) => ({
+          id: docSnap.id,
+          ...docSnap.data(),
+          shifts: docSnap.data().shifts || [],
+        }))
+        .filter((u) => (u.role || "").toLowerCase() === "staff")
+        .map((u) => ({
+          ...u,
+          _hours: computeWeeklyUsage(u),
+        }));
+      setStaffList(staff);
+    } catch (error) {
+      console.error("Error fetching staff:", error);
+    } finally {
+      setLoadingStaff(false);
+    }
+  }, [computeWeeklyUsage]);
+
+  // Fetch staff or staff's next shift
   useEffect(() => {
-    const fetchStaff = async () => {
-      if (user?.role === "Admin" || user?.role === "HR") {
-        setLoadingStaff(true);
-        try {
-          const querySnapshot = await getDocs(collection(db, "UsersDetail"));
-          const staff = querySnapshot.docs
-            .map((doc) => ({
-              id: doc.id,
-              ...doc.data(),
-              shifts: doc.data().shifts || [], // ✅ Ensure shifts array exists
-            }))
-            .filter((user) => user.role === "Staff");
-          setStaffList(staff);
-        } catch (error) {
-          console.error("Error fetching staff:", error);
-        } finally {
-          setLoadingStaff(false);
-        }
-      }
-    };
-
     const getNextShift = (shifts) => {
       const now = new Date();
-      const futureShifts = shifts
-        .map((shift) => {
-          const shiftDateTime = new Date(
-            `${shift.shiftDate}T${shift.shiftStartTime}`
-          );
-          return { ...shift, shiftDateTime };
-        })
-        .filter((shift) => shift.shiftDateTime > now);
-
-      futureShifts.sort((a, b) => a.shiftDateTime - b.shiftDateTime);
+      const futureShifts = (shifts || [])
+        .map((shift) => ({
+          ...shift,
+          shiftDateTime: new Date(`${shift.shiftDate}T${shift.shiftStartTime}`),
+        }))
+        .filter((s) => s.shiftDateTime > now)
+        .sort((a, b) => +a.shiftDateTime - +b.shiftDateTime);
       return futureShifts[0] || null;
     };
 
     const fetchUserShifts = async () => {
       try {
-        const querySnapshot = await getDocs(collection(db, "UsersDetail"));
+        const qs = await getDocs(collection(db, "UsersDetail"));
         let userData = null;
-
-        querySnapshot.forEach((docSnap) => {
+        qs.forEach((docSnap) => {
           const data = docSnap.data();
-          if (data.email === user.email) {
-            userData = data;
-          }
+          if (data.email === user.email) userData = data;
         });
-
         if (userData && Array.isArray(userData.shifts)) {
-          const upcoming = getNextShift(userData.shifts);
-          setNextShift(upcoming);
+          setNextShift(getNextShift(userData.shifts));
         }
       } catch (err) {
         console.error("Error fetching user shift:", err);
       }
     };
 
-    if (user?.role === "Staff") {
-      fetchUserShifts();
-    } else {
-      fetchStaff();
-    }
-  }, [user]);
+    if (user?.role === "Staff") fetchUserShifts();
+    else refetchStaff();
+  }, [user, refetchStaff]);
 
   useEffect(() => {
     const fetchUserMessages = async () => {
       try {
-        const querySnapshot = await getDocs(collection(db, "UsersDetail"));
-        querySnapshot.forEach((docSnap) => {
+        const qs = await getDocs(collection(db, "UsersDetail"));
+        qs.forEach((docSnap) => {
           const data = docSnap.data();
           if (data.email === user.email) {
-            // Ensure we have messages
-            const userMessages = Array.isArray(data.messages)
-              ? data.messages
-              : [];
-
-            const sortedMessages = [...userMessages].sort(
+            const userMessages = Array.isArray(data.messages) ? data.messages : [];
+            const sorted = [...userMessages].sort(
               (a, b) => new Date(b.sentAt) - new Date(a.sentAt)
             );
-            console.log("sortmmes >>>>>>>>>>>>>>>>", sortedMessages);
-            setMessages(sortedMessages);
+            setMessages(sorted);
           }
         });
       } catch (error) {
         console.error("Error fetching messages:", error);
       }
     };
-
-    if (user?.role === "Staff") {
-      fetchUserMessages();
-    }
+    if (user?.role === "Staff") fetchUserMessages();
   }, [user]);
 
-  const handleSendMessage = async () => {
-    if (!messageUserId || !messageText) {
-      alert("Please type a message first.");
-      return;
-    }
-    setIsSendingMessage(true);
-
-    try {
-      const userRef = doc(db, "UsersDetail", messageUserId);
-
-      // Save message in Firestore
-      await updateDoc(userRef, {
-        messages: arrayUnion({
-          text: messageText,
-          sentAt: new Date().toISOString(),
-          from: user?.name || "Admin",
-        }),
-      });
-
-      // Send push notification
-      const userSnap = await getDoc(userRef);
-      if (userSnap.exists()) {
-        const fcmToken = userSnap.data().fcmToken;
-        SendNotification(fcmToken, messageText);
-        alert("Message sent successfully!");
-      }
-
-      setMessageUserId("");
-      setMessageText("");
-    } catch (error) {
-      console.error("Error sending message:", error);
-      alert("Failed to send message.");
-    } finally {
-      setIsSendingMessage(false);
-    }
-  };
-
-  // Assign shift
-  const handleAssignShift = async () => {
-    if (!selectedUserId || !shiftDate || !shiftRole || !shiftStartTime) return;
-    setIsSaving(true);
-    try {
-      const userRef = doc(db, "UsersDetail", selectedUserId);
-      await updateDoc(userRef, {
-        shifts: arrayUnion({
-          shiftDate,
-          shiftRole,
-          shiftStartTime,
-        }),
-      });
-
-      const fcmTokenRef = doc(db, "UsersDetail", selectedUserId);
-      const userSnap = await getDoc(fcmTokenRef);
-
-      if (userSnap.exists()) {
-        alert("Shift assigned successfully!");
-        const fcmToken = userSnap.data().fcmToken;
-        SendNotification(fcmToken);
-      }
-
-      setSelectedUserId("");
-      setShiftDate("");
-      setShiftRole("");
-      setShiftStartTime("");
-    } catch (error) {
-      console.error("Error assigning shift:", error);
-      alert("Failed to assign shift.");
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
-  const SendNotification = (fcmToken) => {
-     console.log("token is >>>>>>>>.",fcmToken)
+  const SendNotification = (fcmToken, customBody) => {
     fetch("http://localhost:3000/send-notification", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         token: fcmToken,
-        title: messageUserId
-          ? "New message from Hr."
-          : "Shift Update from VantageCare",
-        body: messageUserId
+        title: messageUserId ? "New message from Hr." : "Shift Update from VantageCare",
+        body: customBody
+          ? customBody
+          : messageUserId
           ? messageText
-          : "Hi there! You’ve got a new shift assigned. Get ready to deliver care with excellence.",
+          : "Hi there! You’ve got a new shift assigned.",
       }),
     })
       .then((res) => res.json())
-      .then((data) => console.log("API Response:", data))
       .catch((err) => console.error("API Error:", err));
+  };
+
+  // -------- Validations ----------
+  const validateOneShiftPerDay = (existingShifts, newDate) => {
+    const exists = (existingShifts || []).some(
+      (s) => s.shiftDate === newDate && s.status !== "cancelled"
+    );
+    return exists ? `This staff already has a shift on ${newDate}.` : "";
+  };
+
+  const validateNoOverlap = (existingShifts, newStart, newEnd) => {
+    for (const s of existingShifts || []) {
+      const { start, end } = parseShiftToDateRange(s);
+      if (!start || !end) continue;
+      if (minutesOverlap(start, end, newStart, newEnd) > 0) {
+        return `Overlaps with existing shift on ${s.shiftDate} (${s.shiftStartTime}${s.shiftEndTime ? `–${s.shiftEndTime}` : ""})`;
+      }
+    }
+    return "";
+  };
+
+  const validateDailyLimit = (newStart, newEnd) => {
+    if (sameLocalDay(newStart, newEnd)) {
+      const mins = Math.floor((newEnd - newStart) / 60000);
+      if (mins > MAX_DAILY_HOURS * 60) {
+        return `Exceeds max daily hours (${MAX_DAILY_HOURS}h).`;
+      }
+    }
+    return "";
+  };
+
+  const validateMinRest = (existingShifts, newStart, newEnd) => {
+    const minRestMs = MIN_REST_HOURS * 60 * 60 * 1000;
+    for (const s of existingShifts || []) {
+      const { start, end } = parseShiftToDateRange(s);
+      if (!start || !end) continue;
+      const restAfterPrev = newStart - end;
+      const restAfterNew = start - newEnd;
+      if (restAfterPrev > 0 && restAfterPrev < minRestMs) {
+        return `Not enough rest since prior shift (${MIN_REST_HOURS}h).`;
+      }
+      if (restAfterNew > 0 && restAfterNew < minRestMs) {
+        return `Not enough rest before next shift (${MIN_REST_HOURS}h).`;
+      }
+    }
+    return "";
+  };
+
+  const validateWeeklyCap = (staff, newStart, newEnd) => {
+    const cap = Number(staff.weeklyHourCap) || DEFAULT_WEEKLY_CAP_HOURS;
+    const { start: wkStart, end: wkEnd } = getIsoWeekWindow(newStart);
+
+    let minutes = 0;
+    for (const s of staff.shifts || []) {
+      if (s.status === "cancelled") continue;
+      const { start, end } = parseShiftToDateRange(s);
+      if (!start || !end) continue;
+      minutes += minutesOverlap(start, end, wkStart, wkEnd);
+    }
+
+    const add = minutesOverlap(newStart, newEnd, wkStart, wkEnd);
+    const usedHours = minutes / 60;
+    const newTotal = usedHours + add / 60;
+    if (newTotal > cap + 1e-6) {
+      return `Weekly cap exceeded: ${newTotal.toFixed(2)}h > ${cap}h. Hours left: ${(cap - usedHours).toFixed(2)}h.`;
+    }
+    return "";
+  };
+
+// Assign shift with validations
+const handleAssignShift = async () => {
+  setValidationError("");
+
+  if (!selectedUserId || !shiftDate || !shiftRole || !shiftStartTime) {
+    setValidationError("Please fill Date, Role, and Start Time.");
+    return;
+  }
+
+  const roleKey = String(shiftRole).trim().toLowerCase();
+  const hasEnd = !!String(shiftEndTime || "").trim();
+
+  // Build the new shift exactly once (include end time if provided)
+  const newShift = {
+    id: (crypto?.randomUUID?.() || Math.random().toString(36).slice(2)),
+    shiftDate: String(shiftDate).trim(),            // 'YYYY-MM-DD'
+    shiftRole: roleKey,
+    shiftStartTime: String(shiftStartTime).trim(),  // 'HH:mm'
+    status: "assigned",
+    createdAt: Timestamp.now(),                     // OK inside array; serverTimestamp() is NOT
+    ...(hasEnd
+      ? { shiftEndTime: String(shiftEndTime).trim() }
+      : { durationMinutes: ROLE_DURATION_MIN[roleKey] || 0 }),
+  };
+
+  if (!newShift.shiftEndTime && !newShift.durationMinutes) {
+    setValidationError("Please enter an End Time or define a role duration.");
+    return;
+  }
+
+  const { start: newStart, end: newEnd } = parseShiftToDateRange(newShift);
+  if (!newStart || !newEnd) {
+    setValidationError("Invalid shift times.");
+    return;
+  }
+
+  const staff = staffList.find((s) => s.id === selectedUserId);
+  if (!staff) {
+    setValidationError("Staff not found.");
+    return;
+  }
+
+  const sameDateErr = validateOneShiftPerDay(staff.shifts, newShift.shiftDate);
+  if (sameDateErr) return setValidationError(sameDateErr);
+
+  const overlapErr = validateNoOverlap(staff.shifts, newStart, newEnd);
+  if (overlapErr) return setValidationError(overlapErr);
+
+  const dailyErr = validateDailyLimit(newStart, newEnd);
+  if (dailyErr) return setValidationError(dailyErr);
+
+  const restErr = validateMinRest(staff.shifts, newStart, newEnd);
+  if (restErr) return setValidationError(restErr);
+
+  const capErr = validateWeeklyCap(staff, newStart, newEnd);
+  if (capErr) return setValidationError(capErr);
+
+  setIsSaving(true);
+  try {
+    const userRef = doc(db, "UsersDetail", selectedUserId);
+
+    // Save the shift (with end time if present); also record a server-side stamp at top-level
+    await updateDoc(userRef, {
+      shifts: arrayUnion(newShift),
+      lastShiftCreatedAt: serverTimestamp(), // top-level is allowed
+    });
+
+    const userSnap = await getDoc(userRef);
+    if (userSnap.exists()) {
+      alert("Shift assigned successfully!");
+      const fcmToken = userSnap.data().fcmToken;
+      if (fcmToken) SendNotification(fcmToken);
+    }
+
+    // Reset form
+    setSelectedUserId("");
+    setShiftDate("");
+    setShiftRole("");
+    setShiftStartTime("");
+    setShiftEndTime("");
+
+    await refetchStaff();
+  } catch (error) {
+    console.error("Error assigning shift:", error);
+    alert("Failed to assign shift.");
+  } finally {
+    setIsSaving(false);
+  }
+};
+
+
+  // Remove shift
+  const handleRemoveShift = async (userId, shift) => {
+    if (!window.confirm(`Remove shift on ${shift.shiftDate} (${shift.shiftRole})?`)) return;
+    try {
+      const userRef = doc(db, "UsersDetail", userId);
+      if (shift.id) {
+              // New path: remove by id
+             const snap = await getDoc(userRef);
+              const curr = Array.isArray(snap.data()?.shifts) ? snap.data().shifts : [];
+              const next = curr.filter(s => s.id !== shift.id);
+              await updateDoc(userRef, { shifts: next });
+            } else {
+              // Legacy path: exact-object remove (works only if object matches exactly)
+              await updateDoc(userRef, { shifts: arrayRemove(shift) });
+            }
+      alert("Shift removed successfully!");
+      await refetchStaff();
+    } catch (error) {
+      console.error("Error removing shift:", error);
+      alert("Failed to remove shift.");
+    }
   };
 
   const formatTime = (time) => {
@@ -223,63 +394,74 @@ const Dashboard = () => {
   };
 
   const handleCancel = () => {
-    setSelectedUserId(null);
+    setSelectedUserId("");
     setShiftDate("");
     setShiftRole("");
     setShiftStartTime("");
+    setShiftEndTime("");
+    setValidationError("");
   };
 
   return (
-    <div className="p-8">
-      <h1 className="text-2xl font-semibold mb-2">Welcome {user?.name}</h1>
-      <p className="text-lg font-medium mb-8">Role: {user?.role}</p>
+    <div className="p-4 sm:p-6 lg:p-8">
+      <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 mb-6">
+        <div>
+          <h1 className="text-xl sm:text-2xl font-semibold">Welcome {user?.name}</h1>
+          <p className="text-sm sm:text-base text-gray-600">Role: {user?.role}</p>
+        </div>
+      </div>
 
-      {/* Staff's own dashboard */}
+      {/* Staff Dashboard */}
       {user?.role === "Staff" && (
-        <div className="flex gap-8 mb-8">
-          <div className="bg-blue-600 text-white w-60 h-40 flex flex-col items-center justify-center rounded-lg shadow-md">
-            <FaCalendarAlt size={36} className="mb-2" />
-            <p className="text-md font-medium">Next Shift</p>
-            {nextShift ? (
-              <>
-                <p className="text-sm mt-1">{nextShift.shiftDate}</p>
-                <p className="text-sm">
-                  {nextShift.shiftRole} - {nextShift.shiftStartTime}
-                </p>
-              </>
-            ) : (
-              <p className="text-sm mt-2">No upcoming Shift</p>
-            )}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-8">
+          <div className="bg-blue-600 text-white rounded-xl shadow-md p-4 flex items-center">
+            <div className="flex-shrink-0">
+              <FaCalendarAlt size={28} className="opacity-90" />
+            </div>
+            <div className="ml-3">
+              <p className="text-sm opacity-90">Next Shift</p>
+              {nextShift ? (
+                <>
+                  <p className="text-base font-medium mt-0.5">{nextShift.shiftDate}</p>
+                  <p className="text-sm opacity-95">
+                    {nextShift.shiftRole} • {nextShift.shiftStartTime}
+                  </p>
+                </>
+              ) : (
+                <p className="text-sm mt-1 opacity-95">No upcoming shift</p>
+              )}
+            </div>
           </div>
-          <div
-            className="bg-blue-600 text-white w-60 h-40 flex flex-col items-center justify-center rounded-lg shadow-md cursor-pointer"
+
+          <button
+            className="bg-blue-600 text-white rounded-xl shadow-md p-4 text-left flex items-center"
             onClick={() => setShowMessagesList(!showMessagesList)}
           >
-            <FaCommentDots size={36} className="mb-2" />
-            <p className="text-md font-medium">Recent message</p>
-
-            {messages.length > 0 ? (
-              <>
-                <p className="text-sm mt-1">{messages[0].text}</p>
-                <p className="text-xs mt-1 opacity-80">
-                  From: {messages[0].from} •{" "}
-                  {new Date(messages[0].sentAt).toLocaleString()}
-                </p>
-                <p className="text-sm mt-1">Total: {messages.length}</p>
-              </>
-            ) : (
-              <p className="text-sm mt-2">No messages found</p>
-            )}
-          </div>
+            <FaCommentDots size={28} className="opacity-90" />
+            <div className="ml-3">
+              <p className="text-sm opacity-90">Recent message</p>
+              {messages.length > 0 ? (
+                <>
+                  <p className="text-sm mt-0.5">{messages[0].text}</p>
+                  <p className="text-xs opacity-80 mt-0.5">
+                    From: {messages[0].from} • {new Date(messages[0].sentAt).toLocaleString()}
+                  </p>
+                </>
+              ) : (
+                <p className="text-sm mt-1 opacity-95">No messages found</p>
+              )}
+            </div>
+          </button>
         </div>
       )}
+
       {showMessagesList && (
-        <div className="mt-4 bg-white border border-gray-300 rounded-lg shadow-md p-4 w-full max-w-lg">
-          <h2 className="text-lg font-semibold mb-3">All Messages</h2>
+        <div className="mt-4 bg-white border border-gray-200 rounded-xl shadow-sm p-4 w-full max-w-2xl">
+          <h2 className="text-base sm:text-lg font-semibold mb-3">All Messages</h2>
           {messages.length > 0 ? (
-            <ul className="max-h-60 overflow-y-auto space-y-3">
+            <ul className="max-h-64 overflow-y-auto space-y-3">
               {messages.map((msg, index) => (
-                <li key={index} className="border-b border-gray-200 pb-2">
+                <li key={index} className="border-b border-gray-100 pb-2">
                   <p className="text-gray-800">{msg.text}</p>
                   <p className="text-xs text-gray-500">
                     From: {msg.from} • {new Date(msg.sentAt).toLocaleString()}
@@ -295,120 +477,170 @@ const Dashboard = () => {
 
       {/* Admin / HR Dashboard */}
       {(user?.role === "Admin" || user?.role === "HR") && (
-        <div>
+        <div className="w-full">
           {!selectedUserId && !messageUserId && (
             <>
-              <h2 className="text-xl font-semibold mb-4">Staff List</h2>
-              <div className="grid grid-cols-[2fr_1fr_1fr] font-semibold text-gray-700 mb-2 px-2">
-                <div>Name</div>
-                <div>Role</div>
-                <div>Action / Shifts</div>
+              <h2 className="text-lg sm:text-xl font-semibold mb-3">Staff List</h2>
+              {/* Responsive header */}
+              <div className="hidden md:grid md:grid-cols-12 font-semibold text-gray-700 mb-2 px-2">
+                <div className="col-span-4">Name</div>
+                <div className="col-span-2">Role</div>
+                <div className="col-span-3">Hours</div>
+                <div className="col-span-3">Actions / Shifts</div>
               </div>
             </>
           )}
 
           {loadingStaff ? (
             <div className="flex items-center gap-2 text-blue-600 font-medium">
-              <svg
-                className="animate-spin h-5 w-5 text-blue-600"
-                xmlns="http://www.w3.org/2000/svg"
-                fill="none"
-                viewBox="0 0 24 24"
-              >
-                <circle
-                  className="opacity-25"
-                  cx="12"
-                  cy="12"
-                  r="10"
-                  stroke="currentColor"
-                  strokeWidth="4"
-                ></circle>
-                <path
-                  className="opacity-75"
-                  fill="currentColor"
-                  d="M4 12a8 8 0 018-8v8z"
-                ></path>
+              <svg className="animate-spin h-5 w-5 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"></path>
               </svg>
               Loading staff list...
             </div>
           ) : (
             !selectedUserId &&
             !messageUserId && (
-              <ul className="mb-4">
-                {staffList.map((staff) => (
-                  <li
-                    key={staff.id}
-                    className="grid grid-cols-[2fr_1fr_1fr] items-start mb-3 px-4 py-2 border-2 border-blue-500 rounded-md bg-white"
-                  >
-                    <span className="font-medium">{staff.name}</span>
-                    <span>{staff.role}</span>
-                    <div className="flex flex-col gap-2">
-                      <div className="flex gap-2">
-                        <button
-                          className="px-3 py-1 bg-green-600 text-white rounded"
-                          onClick={() => {
-                            setSelectedUserId(staff.id);
-                          }}
-                        >
-                          Assign Shift
-                        </button>
-                        <button
-                          className="px-3 py-1 bg-blue-600 text-white rounded"
-                          onClick={() => setMessageUserId(staff.id)}
-                        >
-                          Message
-                        </button>
-                      </div>
+              <ul className="space-y-3">
+                {staffList.map((staff) => {
+                  const u = staff._hours || { usedHours: 0, left: 0, cap: 0, usedPct: 0 };
+                  const barPct = u.usedPct;
+                  const barColor = usageColor(barPct);
+                  const chip = chipColor(barPct);
 
-                      {/* Show assigned shifts */}
-                      {staff.shifts && staff.shifts.length > 0 ? (
-                        <div className="bg-gray-100 p-2 rounded text-sm max-h-32 overflow-y-auto">
-                          <p className="font-semibold mb-1">Assigned Shifts:</p>
-                          {staff.shifts.map((shift, idx) => (
-                            <p key={idx} className="text-gray-700">
-                              {shift.shiftDate} - {shift.shiftRole} (
-                              {formatTime(shift.shiftStartTime)})
-                            </p>
-                          ))}
+                  return (
+                    <li
+                      key={staff.id}
+                      className="bg-white border border-gray-200 rounded-xl p-3 md:p-4 shadow-sm"
+                    >
+                      {/* Row layout: responsive */}
+                      <div className="grid grid-cols-1 md:grid-cols-12 gap-3 md:gap-4">
+                        {/* Name + role */}
+                        <div className="md:col-span-4 flex items-center justify-between md:block">
+                          <div>
+                            <div className="font-medium text-gray-900">{staff.name}</div>
+                            <div className="text-sm text-gray-500 md:mt-0.5">{staff.role}</div>
+                          </div>
+                          {/* On mobile, quick actions inline */}
+                          <div className="flex md:hidden gap-2">
+                            <button
+                              className="px-3 py-1.5 bg-green-600 text-white text-sm rounded-lg"
+                              onClick={() => setSelectedUserId(staff.id)}
+                            >
+                              Assign
+                            </button>
+                            <button
+                              className="px-3 py-1.5 bg-blue-600 text-white text-sm rounded-lg"
+                              onClick={() => setMessageUserId(staff.id)}
+                            >
+                              Message
+                            </button>
+                          </div>
                         </div>
-                      ) : (
-                        <p className="text-gray-500 text-sm">
-                          No shifts assigned
-                        </p>
-                      )}
-                    </div>
-                  </li>
-                ))}
+
+                        {/* Hours Card */}
+                        <div className="md:col-span-5">
+                          <div className={`rounded-xl border border-gray-200 p-3`}>
+                            <div className="flex items-center justify-between">
+                              <div className={`text-xs font-semibold px-2 py-1 rounded-full ring-1 ${chip}`}>
+                                {barPct.toFixed(0)}% used
+                              </div>
+                              <div className="text-xs text-gray-500">This week</div>
+                            </div>
+
+                            {/* Progress bar */}
+                            <div className="mt-2">
+                              <div className="w-full h-2.5 bg-gray-200 rounded-full overflow-hidden">
+                                <div
+                                  className={`h-2.5 ${barColor} transition-all`}
+                                  style={{ width: `${barPct}%` }}
+                                />
+                              </div>
+                            </div>
+
+                            {/* Numbers row */}
+                            <div className="mt-2 grid grid-cols-3 gap-2 text-xs sm:text-sm">
+                              <div className="rounded-lg bg-gray-50 p-2 text-center">
+                                <div className="text-gray-500">Used</div>
+                                <div className="font-semibold text-gray-900">{u.usedHours}h</div>
+                              </div>
+                              <div className="rounded-lg bg-gray-50 p-2 text-center">
+                                <div className="text-gray-500">Left</div>
+                                <div className="font-semibold text-gray-900">{u.left}h</div>
+                              </div>
+                              <div className="rounded-lg bg-gray-50 p-2 text-center">
+                                <div className="text-gray-500">Cap</div>
+                                <div className="font-semibold text-gray-900">{u.cap}h</div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Actions + Shifts */}
+                        <div className="md:col-span-3 flex flex-col gap-2">
+                          <div className="hidden md:flex gap-2">
+                            <button
+                              className="px-3 py-1.5 bg-green-600 text-white text-sm rounded-lg"
+                              onClick={() => setSelectedUserId(staff.id)}
+                            >
+                              Assign Shift
+                            </button>
+                            <button
+                              className="px-3 py-1.5 bg-blue-600 text-white text-sm rounded-lg"
+                              onClick={() => setMessageUserId(staff.id)}
+                            >
+                              Message
+                            </button>
+                          </div>
+
+                          {staff.shifts && staff.shifts.length > 0 ? (
+                            <div className="bg-gray-50 border border-gray-200 rounded-lg p-2 max-h-44 overflow-y-auto">
+                              <p className="font-semibold text-sm text-gray-700 mb-1">Assigned Shifts</p>
+                              {staff.shifts.map((shift, idx) => (
+                                <div key={idx} className="flex justify-between items-center text-gray-700 mb-1">
+                                  <span className="text-xs sm:text-sm">
+                                    {shift.shiftDate} • {shift.shiftRole} (
+                                    {formatTime(shift.shiftStartTime)}
+                                    {shift.shiftEndTime ? `–${formatTime(shift.shiftEndTime)}` : ""}
+                                    )
+                                  </span>
+                                  <button
+                                    className="ml-2 px-2 py-0.5 bg-red-600 text-white text-[11px] sm:text-xs rounded"
+                                    onClick={() => handleRemoveShift(staff.id, shift)}
+                                  >
+                                    Remove
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="text-gray-500 text-sm">No shifts</p>
+                          )}
+                        </div>
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             )
           )}
-          {messageUserId && (
-            <div className="bg-gray-100 p-4 rounded shadow-md w-full max-w-md mt-4">
-              <h3 className="text-lg font-semibold mb-2">Send Message</h3>
 
+          {messageUserId && (
+            <div className="bg-white border border-gray-200 rounded-xl shadow-sm p-4 w-full max-w-xl mt-4">
+              <h3 className="text-lg font-semibold mb-2">Send Message</h3>
               <textarea
                 placeholder="Type your message here..."
-                className="block w-full p-2 mt-1 border rounded mb-4"
+                className="block w-full p-2 mt-1 border rounded"
                 value={messageText}
                 onChange={(e) => setMessageText(e.target.value)}
               />
-
-              <div className="flex justify-end gap-2">
-                <button
-                  className="px-4 py-2 bg-gray-400 text-white rounded"
-                  onClick={() => {
-                    setMessageUserId("");
-                    setMessageText("");
-                  }}
-                >
+              <div className="flex justify-end gap-2 mt-3">
+                <button className="px-4 py-2 bg-gray-400 text-white rounded" onClick={() => { setMessageUserId(""); setMessageText(""); }}>
                   Cancel
                 </button>
                 <button
-                  className={`px-4 py-2 rounded text-white ${
-                    isSendingMessage
-                      ? "bg-blue-400 cursor-not-allowed"
-                      : "bg-blue-600"
-                  }`}
+                  className={`px-4 py-2 rounded text-white ${isSendingMessage ? "bg-blue-400 cursor-not-allowed" : "bg-blue-600"}`}
                   onClick={handleSendMessage}
                   disabled={isSendingMessage}
                 >
@@ -419,11 +651,15 @@ const Dashboard = () => {
           )}
 
           {selectedUserId && (
-            <div className="bg-gray-100 p-4 rounded shadow-md w-full max-w-md">
+            <div className="bg-white border border-gray-200 rounded-xl shadow-sm p-4 w-full max-w-xl mt-4">
               <h3 className="text-lg font-semibold mb-2">Assign Shift</h3>
 
+              {validationError && (
+                <div className="mb-3 p-2 bg-red-50 text-red-700 rounded border border-red-200">{validationError}</div>
+              )}
+
               <label className="block mb-2">
-                Date:
+                <span className="text-sm text-gray-700">Date</span>
                 <input
                   type="date"
                   className="block w-full p-2 mt-1 border rounded"
@@ -433,61 +669,57 @@ const Dashboard = () => {
               </label>
 
               <label className="block mb-2">
-                Shift Role:
+                <span className="text-sm text-gray-700">Shift Role</span>
                 <input
                   type="text"
-                  placeholder="e.g., Morning, Evening"
+                  placeholder="e.g., morning, evening, night"
                   className="block w-full p-2 mt-1 border rounded"
                   value={shiftRole}
                   onChange={(e) => setShiftRole(e.target.value)}
                 />
+                {!ROLE_DURATION_MIN[shiftRole.toLowerCase()] && (
+                  <p className="text-xs text-gray-500 mt-1">
+                    Tip: define a duration for this role or set End Time below.
+                  </p>
+                )}
               </label>
 
-              <label className="block mb-4">
-                Start Time:
-                <input
-                  type="time"
-                  className="block w-full p-2 mt-1 border rounded"
-                  value={shiftStartTime}
-                  onChange={(e) => setShiftStartTime(e.target.value)}
-                />
-              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <label className="block">
+                  <span className="text-sm text-gray-700">Start Time</span>
+                  <input
+                    type="time"
+                    className="block w-full p-2 mt-1 border rounded"
+                    value={shiftStartTime}
+                    onChange={(e) => setShiftStartTime(e.target.value)}
+                  />
+                </label>
 
-              <div className="flex justify-end gap-2">
-                <button
-                  className="px-4 py-2 bg-gray-400 text-white rounded"
-                  onClick={handleCancel}
-                >
+                <label className="block">
+                  <span className="text-sm text-gray-700">End Time (optional)</span>
+                  <input
+                    type="time"
+                    className="block w-full p-2 mt-1 border rounded"
+                    value={shiftEndTime}
+                    onChange={(e) => setShiftEndTime(e.target.value)}
+                  />
+                </label>
+              </div>
+
+              <div className="flex justify-end gap-2 mt-4">
+                <button className="px-4 py-2 bg-gray-400 text-white rounded" onClick={handleCancel}>
                   Cancel
                 </button>
                 <button
-                  className={`px-4 py-2 rounded text-white ${
-                    isSaving ? "bg-blue-400 cursor-not-allowed" : "bg-blue-600"
-                  }`}
+                  className={`px-4 py-2 rounded text-white ${isSaving ? "bg-blue-400 cursor-not-allowed" : "bg-blue-600"}`}
                   onClick={handleAssignShift}
                   disabled={isSaving}
                 >
                   {isSaving ? (
                     <span className="flex items-center gap-2">
-                      <svg
-                        className="animate-spin h-4 w-4 text-white"
-                        xmlns="http://www.w3.org/2000/svg"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                      >
-                        <circle
-                          className="opacity-25"
-                          cx="12"
-                          cy="12"
-                          r="10"
-                          stroke="currentColor"
-                          strokeWidth="4"
-                        ></circle>
-                        <path
-                          className="opacity-75"
-                          fill="currentColor"
-                          d="M4 12a8 8 0 018-8v8z"
-                        ></path>
+                      <svg className="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"></path>
                       </svg>
                       Saving...
                     </span>
