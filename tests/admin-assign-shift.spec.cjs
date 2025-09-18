@@ -1,88 +1,179 @@
-// tests/admin-assign-shift.spec.cjs
 const { test, expect } = require('@playwright/test');
 
-test.setTimeout(90_000);
+test.setTimeout(120_000);
 
-const BASE_URL    = process.env.BASE_URL    || 'http://localhost:5173';
-const ADMIN_USER  = process.env.ADMIN_USER  || 'Alex002';
-const ADMIN_PASS  = process.env.ADMIN_PASS  || '123456';
+const BASE_URL   = process.env.BASE_URL   || 'http://localhost:5173';
+const ADMIN_USER = process.env.ADMIN_USER || 'Alex002';
+const ADMIN_PASS = process.env.ADMIN_PASS || '123456';
 
-const STAFF_NAME  = process.env.STAFF_NAME  || 'Vicky001';
-const SHIFT_DATE  = process.env.SHIFT_DATE  || '2025-09-15';
+const STAFF_NAME = process.env.STAFF_NAME || 'vicky';
+
+/* Tomorrow in local YYYY-MM-DD */
+function tomorrowYMD() {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+const SHIFT_DATE  = process.env.SHIFT_DATE  || tomorrowYMD();
 const SHIFT_ROLE  = process.env.SHIFT_ROLE  || 'morning';
-const SHIFT_START = process.env.SHIFT_START || '08:00';
-const SHIFT_END   = process.env.SHIFT_END   || '18:00';
+const SHIFT_START = process.env.SHIFT_START || '09:00';
+const SHIFT_END   = process.env.SHIFT_END   || '17:00';
+
 
 function escRe(s){ return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 async function login(page, username, password) {
   await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
 
-  const userInput = page
-    .getByPlaceholder(/username/i).first()
-    .or(page.getByLabel(/user(name)?/i).first())
-    .or(page.locator('input[name="username"], #username, input[type="text"]').first());
+  const user = page.getByPlaceholder('Username').first();
+  const pass = page.getByPlaceholder('Password').first();
+  await user.waitFor({ state: 'visible', timeout: 15_000 });
+  await pass.waitFor({ state: 'visible', timeout: 15_000 });
 
-  // If not visible at /, try /login
-  try { await userInput.waitFor({ state:'visible', timeout:8000 }); }
-  catch {
-    await page.goto(`${BASE_URL}/login`, { waitUntil:'domcontentloaded' });
-    await userInput.waitFor({ state:'visible', timeout:15000 });
+  await user.fill(username);
+  await pass.fill(password);
+  await page.getByRole('button', { name: /^sign in$/i }).click();
+
+  await page.waitForURL(/\/dashboard(?:\?|#|$)/, { timeout: 30_000 });
+  await page.waitForLoadState('domcontentloaded');
+}
+
+async function waitForAdminDashboard(page) {
+  await expect(page.getByText(/^Role:\s*(Admin|HR)/i)).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole('heading', { name: /^staff list$/i })).toBeVisible({ timeout: 30_000 });
+
+  const loading = page.getByText(/^Loading staff list/i);
+  if (await loading.isVisible().catch(() => false)) {
+    await loading.waitFor({ state: 'hidden', timeout: 60_000 }).catch(() => {});
   }
 
-  const passInput = page
-    .getByPlaceholder(/password/i).first()
-    .or(page.getByLabel(/password/i).first())
-    .or(page.locator('input[type="password"]').first());
-
-  await userInput.fill(username);
-  await passInput.fill(password);
-  await page.getByRole('button', { name:/sign in/i }).first().click();
-
-  // Post-login cue (don’t use networkidle with SPAs)
-  await Promise.race([
-    page.waitForURL(/dashboard|\/$/, { timeout:30000 }),
-    page.getByRole('heading', { name:/welcome/i }).waitFor({ timeout:30000 }),
-  ]);
+  await expect.poll(async () => page.getByRole('listitem').count(), {
+    timeout: 60_000,
+    intervals: [500, 1000],
+  }).toBeGreaterThan(0);
 }
 
-async function waitForStaffListReady(page) {
-  // 1) Heading exists (unique)
-  await expect(page.getByRole('heading', { name: /^Staff List$/i })).toBeVisible();
+/** Find the <li> that really contains the staff name (case-insensitive). */
+async function findStaffRow(page, name) {
+  const row = page
+    .getByRole('listitem')
+    .filter({ has: page.getByText(new RegExp(`\\b${escRe(name)}\\b`, 'i')) })
+    .first();
 
-  // 2) Loading row disappears (this avoids strict-mode collision)
-  const loading = page.locator('text=/^Loading staff list/i');
-  await loading.waitFor({ state: 'hidden', timeout: 60_000 });
-
-  // 3) List has at least one row (robust against slow Firestore)
-  await expect.poll(
-    async () => await page.locator('li').count(),
-    { timeout: 60_000, intervals: [500, 1000] }
-  ).toBeGreaterThan(0);
+  await expect(row, `Staff row for "${name}" not found`).toBeVisible({ timeout: 30_000 });
+  await row.scrollIntoViewIfNeeded().catch(() => {});
+  return row;
 }
 
-test('admin assigns a shift to a staff member', async ({ page }) => {
-  await login(page, ADMIN_USER, ADMIN_PASS);
-  await waitForStaffListReady(page);
+/** Open the Assign Shift panel for a given row (desktop: "Assign Shift", mobile: "Assign"). */
+async function openAssignFormForRow(row) {
+  const btn = row.getByRole('button', { name: /assign( shift)?/i }).first();
+  await btn.scrollIntoViewIfNeeded();
+  await btn.click();
+  await expect(row.page().getByRole('heading', { name: /assign shift/i }))
+    .toBeVisible({ timeout: 15_000 });
+}
 
-  // Target staff row
-  const row = page.locator('li', { hasText: new RegExp(escRe(STAFF_NAME), 'i') }).first();
-  await row.waitFor({ timeout: 30_000 });
+/** Fill the assign form with given values and click Save (does not assert outcomes). */
+async function fillAndSaveAssignForm(page, { dateStr, role, start, end }) {
+  const panel = page.locator('div', {
+    has: page.getByRole('heading', { name: /assign shift/i }),
+  }).first();
 
-  // Open assign form
-  await row.getByRole('button', { name: /assign( shift)?/i }).first().click();
+  const date = panel.getByLabel(/^Date$/i).or(panel.locator('input[type="date"]').first());
+  await date.fill(dateStr);
 
-  // Fill form
-  await page.getByLabel(/^Date$/i).fill(SHIFT_DATE);
-  await page.getByLabel(/^Shift Role$/i).fill(SHIFT_ROLE);
-  await page.getByLabel(/^Start Time$/i).fill(SHIFT_START);
-  await page.getByLabel(/^End Time/i).fill(SHIFT_END);
+  let roleInput = panel.getByLabel(/^Shift Role$/i);
+  if (!(await roleInput.isVisible().catch(() => false))) {
+    roleInput = panel.getByPlaceholder(/morning.*evening.*night/i);
+  }
+  await roleInput.fill('');
+  await roleInput.type(role, { delay: 10 });
+  await expect(roleInput).toHaveValue(role);
 
-  // App shows alert on success — accept it
-  page.once('dialog', d => d.accept());
-  await page.getByRole('button', { name:/save shift/i }).click();
+  const startInput = panel.getByLabel(/^Start Time$/i).or(panel.locator('input[type="time"]').nth(0));
+  const endInput   = panel.getByLabel(/^End Time/i).or(panel.locator('input[type="time"]').nth(1));
+  await startInput.fill(start);
+  await endInput.fill(end);
 
-  // Assert row reflects new shift
-  await expect(row.getByText(SHIFT_DATE)).toBeVisible({ timeout: 20_000 });
-  await expect(row.getByText(/\bassigned\b/i)).toBeVisible();
+  // Save
+  const dialogPromise = page.waitForEvent('dialog', { timeout: 6000 }).catch(() => null);
+  await panel.getByRole('button', { name: /^save shift$/i }).click();
+  return dialogPromise; // may resolve if success alert fires
+}
+
+/** Ensure staff has a shift on date: if missing, create one (accept alert, wait for it to render). */
+async function ensureShiftExists(page, row, { dateStr, role, start, end }) {
+  // If shift already present, we're done
+  const already = await row
+    .locator('div', { hasText: new RegExp(`\\b${escRe(dateStr)}\\b`) })
+    .count();
+  if (already > 0) return;
+
+  // Otherwise create one
+  await openAssignFormForRow(row);
+  const dlg = await fillAndSaveAssignForm(page, { dateStr, role, start, end });
+  if (dlg) await dlg.accept();
+
+  // Wait for it to appear under the row
+  const line = row.locator('div', {
+    hasText: new RegExp(`${escRe(dateStr)}.*\\b${escRe(role)}\\b`, 'i'),
+  }).first();
+  await expect.poll(async () => await line.count(), {
+    timeout: 45_000, intervals: [500, 1000],
+  }).toBeGreaterThan(0);
+}
+
+test('admin sees duplicate-shift validation when assigning a day that is already taken', async ({ page }) => {
+  await test.step('Login & land on Admin dashboard', async () => {
+    await login(page, ADMIN_USER, ADMIN_PASS);
+    await waitForAdminDashboard(page);
+  });
+
+  // Find the staff row
+  const row = await findStaffRow(page, STAFF_NAME);
+
+  // Precondition: make sure a shift exists on SHIFT_DATE
+  await test.step(`Ensure ${STAFF_NAME} already has a shift on ${SHIFT_DATE}`, async () => {
+    await ensureShiftExists(page, row, {
+      dateStr: SHIFT_DATE,
+      role: SHIFT_ROLE,
+      start: SHIFT_START,
+      end: SHIFT_END,
+    });
+  });
+
+  // Attempt to assign AGAIN on the same date -> expect validation banner
+  await test.step('Try assigning the same day again and expect the red duplicate banner', async () => {
+    await openAssignFormForRow(row);
+
+    // Fill same date/role/times and save
+    const dialogPromise = await fillAndSaveAssignForm(page, {
+      dateStr: SHIFT_DATE,
+      role: SHIFT_ROLE,
+      start: SHIFT_START,
+      end: SHIFT_END,
+    });
+
+    // Assert duplicate banner appears
+    const panel = page.locator('div', {
+      has: page.getByRole('heading', { name: /assign shift/i }),
+    }).first();
+
+    const duplicateBanner = panel.getByText(
+      new RegExp(`already has a shift on\\s+${escRe(SHIFT_DATE)}`, 'i')
+    );
+
+    await expect(duplicateBanner).toBeVisible({ timeout: 5000 });
+
+    // If by any chance a success alert popped, fail (we expected a duplicate)
+    const dlg = await dialogPromise;
+    if (dlg) {
+      await dlg.dismiss().catch(() => {});
+      throw new Error('Expected duplicate warning, but got success alert instead.');
+    }
+  });
 });
