@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from "react";
 import { FaCalendarAlt, FaCommentDots } from "react-icons/fa";
+import { Link } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { db } from "../firebase";
 import {
@@ -10,8 +11,6 @@ import {
   getDoc,
   arrayUnion,
   arrayRemove,
-  serverTimestamp,
-  Timestamp,
 } from "firebase/firestore";
 
 /* ======= NDIS / Policy knobs ======= */
@@ -82,15 +81,6 @@ const Dashboard = () => {
   const [staffList, setStaffList] = useState([]);
   const [loadingStaff, setLoadingStaff] = useState(false);
 
-  // Assign shift form
-  const [selectedUserId, setSelectedUserId] = useState("");
-  const [shiftRole, setShiftRole] = useState("");
-  const [shiftDate, setShiftDate] = useState("");
-  const [shiftStartTime, setShiftStartTime] = useState("");
-  const [shiftEndTime, setShiftEndTime] = useState("");
-  const [isSaving, setIsSaving] = useState(false);
-  const [validationError, setValidationError] = useState("");
-
   // Messages
   const [messageUserId, setMessageUserId] = useState("");
   const [messageText, setMessageText] = useState("");
@@ -101,39 +91,7 @@ const Dashboard = () => {
   // Staff view: next shift
   const [nextShift, setNextShift] = useState(null);
 
-  // Admin queue busy row
-  const [pendingBusy, setPendingBusy] = useState(null);
-
   // ---- Helpers inside component ----
-  const fmtHM = (time) => {
-    if (!time) return "—";
-    const [hour, minute] = String(time).split(":");
-    let h = parseInt(hour, 10);
-    const ampm = h >= 12 ? "PM" : "AM";
-    h = h % 12 || 12;
-    return `${h}:${minute} ${ampm}`;
-  };
-
-  const keyOf = (uId, s) =>
-    `${uId}:${s.id || `${s.shiftDate}|${s.shiftRole}|${s.shiftStartTime}|${s.shiftEndTime || ""}`}`;
-
-  const getFromTo = (s) => {
-    const hasReq = s.request && (s.request.shiftStartTime || s.request.shiftEndTime);
-    return hasReq
-      ? {
-          fromStart: s.shiftStartTime,
-          fromEnd: s.shiftEndTime || "",
-          toStart: s.request.shiftStartTime || s.shiftStartTime,
-          toEnd: s.request.shiftEndTime || s.shiftEndTime || "",
-        }
-      : {
-          fromStart: "",
-          fromEnd: "",
-          toStart: s.shiftStartTime,
-          toEnd: s.shiftEndTime || "",
-        };
-  };
-
   const computeWeeklyUsage = useCallback((u, refDate = new Date()) => {
     const cap = Number(u.weeklyHourCap) || DEFAULT_WEEKLY_CAP_HOURS;
     const { start, end } = getIsoWeekWindow(refDate);
@@ -237,170 +195,12 @@ const Dashboard = () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         token: fcmToken,
-        title: messageUserId ? "New message from Hr." : "Shift Update from VantageCare",
-        body: customBody
-          ? customBody
-          : messageUserId
-          ? messageText
-          : "Hi there! You’ve got a new shift assigned.",
+        title: "Shift Update from VantageCare",
+        body: customBody ?? "Hi there! You’ve got a new message.",
       }),
     })
       .then((res) => res.json())
       .catch((err) => console.error("API Error:", err));
-  };
-
-  /* ---------- Validations ---------- */
-  const validateOneShiftPerDay = (existingShifts, newDate) => {
-    const exists = (existingShifts || []).some(
-      (s) => s.shiftDate === newDate && s.status !== "cancelled"
-    );
-    return exists ? `This staff already has a shift on ${newDate}.` : "";
-    };
-
-  const validateNoOverlap = (existingShifts, newStart, newEnd) => {
-    for (const s of existingShifts || []) {
-      const { start, end } = parseShiftToDateRange(s);
-      if (!start || !end) continue;
-      if (minutesOverlap(start, end, newStart, newEnd) > 0) {
-        return `Overlaps with existing shift on ${s.shiftDate} (${s.shiftStartTime}${s.shiftEndTime ? `–${s.shiftEndTime}` : ""})`;
-      }
-    }
-    return "";
-  };
-
-  const validateDailyLimit = (newStart, newEnd) => {
-    if (sameLocalDay(newStart, newEnd)) {
-      const mins = Math.floor((newEnd - newStart) / 60000);
-      if (mins > MAX_DAILY_HOURS * 60) {
-        return `Exceeds max daily hours (${MAX_DAILY_HOURS}h).`;
-      }
-    }
-    return "";
-  };
-
-  const validateMinRest = (existingShifts, newStart, newEnd) => {
-    const minRestMs = MIN_REST_HOURS * 60 * 60 * 1000;
-    for (const s of existingShifts || []) {
-      const { start, end } = parseShiftToDateRange(s);
-      if (!start || !end) continue;
-      const restAfterPrev = newStart - end;
-      const restAfterNew = start - newEnd;
-      if (restAfterPrev > 0 && restAfterPrev < minRestMs) {
-        return `Not enough rest since prior shift (${MIN_REST_HOURS}h).`;
-      }
-      if (restAfterNew > 0 && restAfterNew < minRestMs) {
-        return `Not enough rest before next shift (${MIN_REST_HOURS}h).`;
-      }
-    }
-    return "";
-  };
-
-  const validateWeeklyCap = (staff, newStart, newEnd) => {
-    const cap = Number(staff.weeklyHourCap) || DEFAULT_WEEKLY_CAP_HOURS;
-    const { start: wkStart, end: wkEnd } = getIsoWeekWindow(newStart);
-
-    let minutes = 0;
-    for (const s of staff.shifts || []) {
-      if (s.status === "cancelled") continue;
-      const { start, end } = parseShiftToDateRange(s);
-      if (!start || !end) continue;
-      minutes += minutesOverlap(start, end, wkStart, wkEnd);
-    }
-
-    const add = minutesOverlap(newStart, newEnd, wkStart, wkEnd);
-    const usedHours = minutes / 60;
-    const newTotal = usedHours + add / 60;
-    if (newTotal > cap + 1e-6) {
-      return `Weekly cap exceeded: ${newTotal.toFixed(2)}h > ${cap}h. Hours left: ${(cap - usedHours).toFixed(2)}h.`;
-    }
-    return "";
-  };
-
-  /* ---------- Assign shift with validations ---------- */
-  const handleAssignShift = async () => {
-    setValidationError("");
-
-    if (!selectedUserId || !shiftDate || !shiftRole || !shiftStartTime) {
-      setValidationError("Please fill Date, Role, and Start Time.");
-      return;
-    }
-
-    const roleKey = String(shiftRole).trim().toLowerCase();
-    const hasEnd = !!String(shiftEndTime || "").trim();
-
-    const newShift = {
-      id: (crypto?.randomUUID?.() || Math.random().toString(36).slice(2)),
-      shiftDate: String(shiftDate).trim(),
-      shiftRole: roleKey,
-      shiftStartTime: String(shiftStartTime).trim(),
-      status: "assigned",
-      createdAt: Timestamp.now(), // OK inside array
-      ...(hasEnd
-        ? { shiftEndTime: String(shiftEndTime).trim() }
-        : { durationMinutes: ROLE_DURATION_MIN[roleKey] || 0 }),
-    };
-
-    if (!newShift.shiftEndTime && !newShift.durationMinutes) {
-      setValidationError("Please enter an End Time or define a role duration.");
-      return;
-    }
-
-    const { start: newStart, end: newEnd } = parseShiftToDateRange(newShift);
-    if (!newStart || !newEnd) {
-      setValidationError("Invalid shift times.");
-      return;
-    }
-
-    const staff = staffList.find((s) => s.id === selectedUserId);
-    if (!staff) {
-      setValidationError("Staff not found.");
-      return;
-    }
-
-    const sameDateErr = validateOneShiftPerDay(staff.shifts, newShift.shiftDate);
-    if (sameDateErr) return setValidationError(sameDateErr);
-
-    const overlapErr = validateNoOverlap(staff.shifts, newStart, newEnd);
-    if (overlapErr) return setValidationError(overlapErr);
-
-    const dailyErr = validateDailyLimit(newStart, newEnd);
-    if (dailyErr) return setValidationError(dailyErr);
-
-    const restErr = validateMinRest(staff.shifts, newStart, newEnd);
-    if (restErr) return setValidationError(restErr);
-
-    const capErr = validateWeeklyCap(staff, newStart, newEnd);
-    if (capErr) return setValidationError(capErr);
-
-    setIsSaving(true);
-    try {
-      const userRef = doc(db, "UsersDetail", selectedUserId);
-
-      await updateDoc(userRef, {
-        shifts: arrayUnion(newShift),
-        lastShiftCreatedAt: serverTimestamp(), // top-level is allowed
-      });
-
-      const userSnap = await getDoc(userRef);
-      if (userSnap.exists()) {
-        alert("Shift assigned successfully!");
-        const fcmToken = userSnap.data().fcmToken;
-        if (fcmToken) SendNotification(fcmToken);
-      }
-
-      setSelectedUserId("");
-      setShiftDate("");
-      setShiftRole("");
-      setShiftStartTime("");
-      setShiftEndTime("");
-
-      await refetchStaff();
-    } catch (error) {
-      console.error("Error assigning shift:", error);
-      alert("Failed to assign shift.");
-    } finally {
-      setIsSaving(false);
-    }
   };
 
   /* ---------- Remove shift ---------- */
@@ -450,107 +250,6 @@ const Dashboard = () => {
     }
   };
 
-  /* ---------- Approve / Reject time change ---------- */
-  const approveTimeChange = async ({ staff, shift }) => {
-    const busyKey = keyOf(staff.id, shift);
-    setPendingBusy(busyKey);
-    try {
-      const userRef = doc(db, "UsersDetail", staff.id);
-      const snap = await getDoc(userRef);
-      const curr = Array.isArray(snap.data()?.shifts) ? snap.data().shifts : [];
-
-      const updated = curr.map((raw) => {
-        const same =
-          (raw.id && shift.id && raw.id === shift.id) ||
-          (raw.shiftDate === shift.shiftDate &&
-            raw.shiftRole === shift.shiftRole &&
-            raw.shiftStartTime === shift.shiftStartTime &&
-            (raw.shiftEndTime || "") === (shift.shiftEndTime || ""));
-
-        if (!same) return raw;
-
-        if (raw.request && (raw.request.shiftStartTime || raw.request.shiftEndTime)) {
-          return {
-            ...raw,
-            shiftStartTime: raw.request.shiftStartTime ?? raw.shiftStartTime,
-            shiftEndTime: raw.request.shiftEndTime ?? raw.shiftEndTime,
-            status: "approved",
-            request: null,
-          };
-        }
-        return { ...raw, status: "approved" };
-      });
-
-      const text = `Your time change for ${shift.shiftDate} (${shift.shiftRole}) has been approved.`;
-      await updateDoc(userRef, {
-        shifts: updated,
-        messages: arrayUnion({ text, from: "HR", sentAt: new Date().toISOString() }),
-      });
-
-      const fcm = snap.data()?.fcmToken;
-      if (fcm) SendNotification(fcm, text);
-
-      await refetchStaff();
-    } catch (e) {
-      console.error("Approve failed:", e);
-      alert("Failed to approve request.");
-    } finally {
-      setPendingBusy(null);
-    }
-  };
-
-  const rejectTimeChange = async ({ staff, shift }) => {
-    const busyKey = keyOf(staff.id, shift);
-    setPendingBusy(busyKey);
-    try {
-      const userRef = doc(db, "UsersDetail", staff.id);
-      const snap = await getDoc(userRef);
-      const curr = Array.isArray(snap.data()?.shifts) ? snap.data().shifts : [];
-
-      const updated = curr.map((raw) => {
-        const same =
-          (raw.id && shift.id && raw.id === shift.id) ||
-          (raw.shiftDate === shift.shiftDate &&
-            raw.shiftRole === shift.shiftRole &&
-            raw.shiftStartTime === shift.shiftStartTime &&
-            (raw.shiftEndTime || "") === (shift.shiftEndTime || ""));
-
-        if (!same) return raw;
-
-        if (raw.request) {
-          const { request, ...rest } = raw; // drop the request
-          return { ...rest, status: "assigned" };
-        }
-        return { ...raw, status: "assigned" };
-      });
-
-      const text = `Your time change for ${shift.shiftDate} (${shift.shiftRole}) was rejected. Your assigned time remains ${fmtHM(shift.shiftStartTime)}${shift.shiftEndTime ? `–${fmtHM(shift.shiftEndTime)}` : ""}.`;
-      await updateDoc(userRef, {
-        shifts: updated,
-        messages: arrayUnion({ text, from: "HR", sentAt: new Date().toISOString() }),
-      });
-
-      const fcm = snap.data()?.fcmToken;
-      if (fcm) SendNotification(fcm, text);
-
-      await refetchStaff();
-    } catch (e) {
-      console.error("Reject failed:", e);
-      alert("Failed to reject request.");
-    } finally {
-      setPendingBusy(null);
-    }
-  };
-
-  /* ---------- Derived: pending requests ---------- */
-  const pendingRequests = React.useMemo(() => {
-    return staffList.flatMap((staff) =>
-      (staff.shifts || [])
-        .filter((s) => (s.status || "").toLowerCase() === "pending")
-        .map((shift) => ({ staff, shift }))
-    );
-  }, [staffList]);
-
   /* ---------- Misc helpers ---------- */
   const formatTime = (time) => {
     const [hour, minute] = time.split(":");
@@ -558,15 +257,6 @@ const Dashboard = () => {
     const ampm = h >= 12 ? "PM" : "AM";
     h = h % 12 || 12;
     return `${h}:${minute} ${ampm}`;
-  };
-
-  const handleCancel = () => {
-    setSelectedUserId("");
-    setShiftDate("");
-    setShiftRole("");
-    setShiftStartTime("");
-    setShiftEndTime("");
-    setValidationError("");
   };
 
   /* ---------- Render ---------- */
@@ -646,68 +336,8 @@ const Dashboard = () => {
       {/* Admin / HR Dashboard */}
       {(user?.role === "Admin" || user?.role === "HR") && (
         <div className="w-full">
-
-          {/* ===== Time change requests queue ===== */}
-          {pendingRequests.length > 0 && (
-            <div className="mb-6">
-              <h2 className="text-lg sm:text-xl font-semibold mb-3">Time change requests</h2>
-              <div className="overflow-x-auto rounded-lg border border-blue-200">
-                <table className="min-w-full text-left">
-                  <thead>
-                    <tr className="bg-blue-600 text-white">
-                      <th className="py-2 px-3 sm:px-4">Staff</th>
-                      <th className="py-2 px-3 sm:px-4">Date</th>
-                      <th className="py-2 px-3 sm:px-4">Role</th>
-                      <th className="py-2 px-3 sm:px-4">From</th>
-                      <th className="py-2 px-3 sm:px-4">To</th>
-                      <th className="py-2 px-3 sm:px-4">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {pendingRequests.map(({ staff, shift }) => {
-                      const { fromStart, fromEnd, toStart, toEnd } = getFromTo(shift);
-                      const rowKey = keyOf(staff.id, shift);
-                      const busy = pendingBusy === rowKey;
-                      return (
-                        <tr key={rowKey} className="odd:bg-blue-50/40">
-                          <td className="py-2 px-3 sm:px-4">{staff.name}</td>
-                          <td className="py-2 px-3 sm:px-4">{shift.shiftDate}</td>
-                          <td className="py-2 px-3 sm:px-4">{shift.shiftRole}</td>
-                          <td className="py-2 px-3 sm:px-4">
-                            {fromStart ? `${fmtHM(fromStart)}${fromEnd ? `–${fmtHM(fromEnd)}` : ""}` : "—"}
-                          </td>
-                          <td className="py-2 px-3 sm:px-4">
-                            {`${fmtHM(toStart)}${toEnd ? `–${fmtHM(toEnd)}` : ""}`}
-                          </td>
-                          <td className="py-2 px-3 sm:px-4">
-                            <div className="flex gap-2">
-                              <button
-                                disabled={busy}
-                                onClick={() => approveTimeChange({ staff, shift })}
-                                className="text-sm px-3 py-1 rounded-lg bg-green-600 text-white hover:bg-green-700 disabled:opacity-50"
-                              >
-                                {busy ? "..." : "Approve"}
-                              </button>
-                              <button
-                                disabled={busy}
-                                onClick={() => rejectTimeChange({ staff, shift })}
-                                className="text-sm px-3 py-1 rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
-                              >
-                                {busy ? "..." : "Reject"}
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
           {/* ===== Staff list header ===== */}
-          {!selectedUserId && !messageUserId && (
+          {!messageUserId && (
             <>
               <h2 className="text-lg sm:text-xl font-semibold mb-3">Staff List</h2>
               <div className="hidden md:grid md:grid-cols-12 font-semibold text-gray-700 mb-2 px-2">
@@ -729,7 +359,6 @@ const Dashboard = () => {
               Loading staff list...
             </div>
           ) : (
-            !selectedUserId &&
             !messageUserId && (
               <ul className="space-y-3">
                 {staffList.map((staff) => {
@@ -751,12 +380,12 @@ const Dashboard = () => {
                             <div className="text-sm text-gray-500 md:mt-0.5">{staff.role}</div>
                           </div>
                           <div className="flex md:hidden gap-2">
-                            <button
-                              className="px-3 py-1.5 bg-green-600 text-white text-sm rounded-lg"
-                              onClick={() => setSelectedUserId(staff.id)}
+                            <Link
+                              to={`/create-shift?userId=${staff.id}`}
+                              className="px-3 py-1.5 bg-green-600 text-white text-sm rounded-lg text-center"
                             >
                               Assign
-                            </button>
+                            </Link>
                             <button
                               className="px-3 py-1.5 bg-blue-600 text-white text-sm rounded-lg"
                               onClick={() => setMessageUserId(staff.id)}
@@ -805,12 +434,12 @@ const Dashboard = () => {
                         {/* Actions + Shifts */}
                         <div className="md:col-span-3 flex flex-col gap-2">
                           <div className="hidden md:flex gap-2">
-                            <button
-                              className="px-3 py-1.5 bg-green-600 text-white text-sm rounded-lg"
-                              onClick={() => setSelectedUserId(staff.id)}
+                            <Link
+                              to={`/create-shift?userId=${staff.id}`}
+                              className="px-3 py-1.5 bg-green-600 text-white text-sm rounded-lg text-center"
                             >
                               Assign Shift
-                            </button>
+                            </Link>
                             <button
                               className="px-3 py-1.5 bg-blue-600 text-white text-sm rounded-lg"
                               onClick={() => setMessageUserId(staff.id)}
@@ -828,7 +457,6 @@ const Dashboard = () => {
                                     {shift.shiftDate} • {shift.shiftRole} (
                                     {formatTime(shift.shiftStartTime)}
                                     {shift.shiftEndTime ? `–${formatTime(shift.shiftEndTime)}` : ""})
-                                    
                                   </span>
                                   <button
                                     className="ml-2 px-2 py-0.5 bg-red-600 text-white text-[11px] sm:text-xs rounded"
@@ -871,88 +499,6 @@ const Dashboard = () => {
                   disabled={isSendingMessage}
                 >
                   {isSendingMessage ? "Sending..." : "Send Message"}
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* ===== Assign shift form ===== */}
-          {selectedUserId && (
-            <div className="bg-white border border-gray-200 rounded-xl shadow-sm p-4 w-full max-w-xl mt-4">
-              <h3 className="text-lg font-semibold mb-2">Assign Shift</h3>
-
-              {validationError && (
-                <div className="mb-3 p-2 bg-red-50 text-red-700 rounded border border-red-200">{validationError}</div>
-              )}
-
-              <label className="block mb-2">
-                <span className="text-sm text-gray-700">Date</span>
-                <input
-                  type="date"
-                  className="block w-full p-2 mt-1 border rounded"
-                  value={shiftDate}
-                  onChange={(e) => setShiftDate(e.target.value)}
-                />
-              </label>
-
-              <label className="block mb-2">
-                <span className="text-sm text-gray-700">Shift Role</span>
-                <input
-                  type="text"
-                  placeholder="e.g., morning, evening, night"
-                  className="block w-full p-2 mt-1 border rounded"
-                  value={shiftRole}
-                  onChange={(e) => setShiftRole(e.target.value)}
-                />
-                {!ROLE_DURATION_MIN[(shiftRole || "").toLowerCase()] && (
-                  <p className="text-xs text-gray-500 mt-1">
-                    Tip: define a duration for this role or set End Time below.
-                  </p>
-                )}
-              </label>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <label className="block">
-                  <span className="text-sm text-gray-700">Start Time</span>
-                  <input
-                    type="time"
-                    className="block w-full p-2 mt-1 border rounded"
-                    value={shiftStartTime}
-                    onChange={(e) => setShiftStartTime(e.target.value)}
-                  />
-                </label>
-
-                <label className="block">
-                  <span className="text-sm text-gray-700">End Time (optional)</span>
-                  <input
-                    type="time"
-                    className="block w-full p-2 mt-1 border rounded"
-                    value={shiftEndTime}
-                    onChange={(e) => setShiftEndTime(e.target.value)}
-                  />
-                </label>
-              </div>
-
-              <div className="flex justify-end gap-2 mt-4">
-                <button className="px-4 py-2 bg-gray-400 text-white rounded" onClick={handleCancel}>
-                  Cancel
-                </button>
-                <button
-                  className={`px-4 py-2 rounded text-white ${isSaving ? "bg-blue-400 cursor-not-allowed" : "bg-blue-600"}`}
-                  onClick={handleAssignShift}
-                  disabled={isSaving}
-                >
-                  {isSaving ? (
-                    <span className="flex items-center gap-2">
-                      <svg className="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"></path>
-                      </svg>
-                      Saving...
-                    </span>
-                  ) : (
-                    "Save Shift"
-                  )}
                 </button>
               </div>
             </div>

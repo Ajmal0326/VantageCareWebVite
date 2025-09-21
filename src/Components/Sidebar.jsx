@@ -22,6 +22,54 @@ const Sidebar = () => {
         >
           Dashboard
         </Link>
+        {["Admin", "HR"].includes(user?.role) && (
+          <Link
+            to="/Approve-TimeSheet"
+            className={`p-2 rounded ${
+              location.pathname.startsWith("/Approve-TimeSheet")
+                ? "bg-blue-900 font-semibold"
+                : "hover:underline"
+            }`}
+          >
+            Approve TimeSheet
+          </Link>
+        )}
+        {["Admin", "HR"].includes(user?.role) && (
+          <Link
+            to="/create-shift"
+            className={`p-2 rounded ${
+              location.pathname.startsWith("/create-shift")
+                ? "bg-blue-900 font-semibold"
+                : "hover:underline"
+            }`}
+          >
+            Create Shift
+          </Link>
+        )}
+        {["Admin", "HR"].includes(user?.role) && (
+          <Link
+            to="/employees"
+            className={`p-2 rounded ${
+              location.pathname.startsWith("/employees")
+                ? "bg-blue-900 font-semibold"
+                : "hover:underline"
+            }`}
+          >
+            Current Employees
+          </Link>
+        )}
+        {["Admin", "HR"].includes(user?.role) && (
+          <Link
+            to="/new-employees"
+            className={`p-2 rounded ${
+              location.pathname.startsWith("/new-employees")
+                ? "bg-blue-900 font-semibold"
+                : "hover:underline"
+            }`}
+          >
+            Create Employee
+          </Link>
+        )}
         {user?.role === "Staff" && (
           <>
             <Link

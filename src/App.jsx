@@ -10,6 +10,10 @@ import Timesheet from './pages/Timesheet';
 import Dashboard from './pages/Dashboard ';
 import Certificate from './pages/Certificate';
 import { useAuth } from './context/AuthContext';
+import ApproveTimeSheet from './pages/ApproveTimeSheet';
+import CreateShift from './pages/CreateShift';
+import CurrentEmployees from './pages/CurrentEmployees';
+import CreateEmployee from './pages/CreateEmployee';
 
 function App() {
 
@@ -25,6 +29,46 @@ function App() {
               <PrivateRoute>
                 <MainLayout>
                   <Dashboard />
+                </MainLayout>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/Approve-TimeSheet"
+            element={
+              <PrivateRoute>
+                <MainLayout>
+                  <ApproveTimeSheet />
+                </MainLayout>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/create-shift"
+            element={
+              <PrivateRoute>
+                <MainLayout>
+                  <CreateShift />
+                </MainLayout>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/employees"
+            element={
+              <PrivateRoute>
+                <MainLayout>
+                  <CurrentEmployees />
+                </MainLayout>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/new-employees"
+            element={
+              <PrivateRoute>
+                <MainLayout>
+                  <CreateEmployee />
                 </MainLayout>
               </PrivateRoute>
             }
